@@ -75,6 +75,34 @@ func (p *pane) move(d, n, h int) {
 	p.clamp(n, h)
 }
 
+// scroll は表示位置だけを動かし、選択は画面内に引き戻す。
+// ホイールで一覧を眺めるときに、選択が勝手に飛ばないようにするため。
+func (p *pane) scroll(d, n, h int) {
+	if n == 0 {
+		p.idx, p.off = 0, 0
+		return
+	}
+	p.off += d
+	if p.off > n-h {
+		p.off = n - h
+	}
+	if p.off < 0 {
+		p.off = 0
+	}
+	if p.idx < p.off {
+		p.idx = p.off
+	}
+	if p.idx >= p.off+h {
+		p.idx = p.off + h - 1
+	}
+	if p.idx >= n {
+		p.idx = n - 1
+	}
+	if p.idx < 0 {
+		p.idx = 0
+	}
+}
+
 // Model は TUI 全体の状態。
 type Model struct {
 	ctxNames   []string
@@ -101,15 +129,21 @@ type Model struct {
 	filters                      map[paneID]string
 
 	// ログ
-	logStream *k8s.LogStream
-	logCancel context.CancelFunc
-	logLines  []k8s.LogLine
-	logKey    string
-	logGen    int
-	logFollow bool
-	logPrev   bool
-	logOff    int // 末尾からの行数（0 = 追従）
-	logScope  string
+	logStream    *k8s.LogStream
+	logCancel    context.CancelFunc
+	logLines     []k8s.LogLine
+	logSeen      map[string]bool // さかのぼり読み込みと追従の重複を弾く
+	logKey       string
+	logGen       int
+	logFollow    bool
+	logPrev      bool
+	logOff       int // 末尾からの行数（0 = 追従）
+	logScope     string
+	logTail      int64 // 今 Pod あたり何行までさかのぼっているか
+	logLoading   bool
+	logExhausted bool
+
+	mouse bool
 
 	input       textinput.Model
 	inputActive bool
@@ -121,7 +155,15 @@ type Model struct {
 	spinner int
 }
 
-const maxLogLines = 20000
+const (
+	maxLogLines = 20000
+
+	// ログは最初に直近 initialLogTail 行だけ読み、上端に着いたら 3 倍ずつ
+	// さかのぼる。Kubernetes のログ API に「途中から」は無く tailLines を
+	// 増やして引き直すしかないので、一気に取らずに段階的に広げる。
+	initialLogTail = 100
+	maxLogTail     = 20000
+)
 
 // New は起動時のモデルを作る。接続に失敗しても TUI は立ち上げ、
 // コンテキスト切り替えでやり直せるようにする。
@@ -136,6 +178,8 @@ func New(initialContext string) Model {
 		filters:   map[paneID]string{},
 		input:     ti,
 		logFollow: true,
+		logTail:   initialLogTail,
+		mouse:     true,
 	}
 	names, current, err := k8s.Contexts()
 	m.ctxNames = names
@@ -200,6 +244,12 @@ type logBatchMsg struct {
 }
 
 type logClosedMsg struct{ gen int }
+
+// logHistoryMsg はさかのぼって取り直した結果。
+type logHistoryMsg struct {
+	gen   int
+	lines []k8s.LogLine
+}
 
 func withTimeout() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 12*time.Second)

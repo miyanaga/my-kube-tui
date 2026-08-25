@@ -3,6 +3,8 @@ package k8s
 import (
 	"bufio"
 	"context"
+	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,12 @@ type LogLine struct {
 	Time      time.Time
 	Text      string
 	Notice    bool // ストリームの開始・終了・エラーを伝える内部行
+}
+
+// Key は重複排除の鍵。さかのぼり読み込みは追従中の行と必ず重なるので、
+// 同じ行を二度積まないためにこれで突き合わせる。
+func (l LogLine) Key() string {
+	return l.Pod + "\x00" + l.Container + "\x00" + l.Time.Format(time.RFC3339Nano) + "\x00" + l.Text
 }
 
 // LogOptions はログ取得の条件。
@@ -52,15 +60,11 @@ func (c *Client) StreamPodLogs(parent context.Context, pods []*Pod, opts LogOpti
 	s := &LogStream{Lines: make(chan LogLine, 4096), cancel: cancel}
 
 	if opts.TailLines <= 0 {
-		opts.TailLines = 200
+		opts.TailLines = 100
 	}
 
 	for _, p := range pods {
-		containers := p.Containers
-		if len(containers) == 0 {
-			containers = []string{""}
-		}
-		for _, cn := range containers {
+		for _, cn := range containersOf(p) {
 			s.wg.Add(1)
 			go c.streamOne(ctx, s, p, cn, opts)
 		}
@@ -75,6 +79,49 @@ func (c *Client) StreamPodLogs(parent context.Context, pods []*Pod, opts LogOpti
 	return s
 }
 
+// FetchPodLogs は追従せずに一括で取得する。さかのぼり読み込み専用。
+// tailLines を増やして引き直し、既に持っている行は呼び出し側で捨てる前提。
+func (c *Client) FetchPodLogs(ctx context.Context, pods []*Pod, opts LogOptions) []LogLine {
+	opts.Follow = false
+	if opts.TailLines <= 0 {
+		opts.TailLines = 100
+	}
+
+	var (
+		mu  sync.Mutex
+		out []LogLine
+		wg  sync.WaitGroup
+	)
+	for _, p := range pods {
+		for _, cn := range containersOf(p) {
+			wg.Add(1)
+			go func(p *Pod, cn string) {
+				defer wg.Done()
+				rc, err := c.openLogs(ctx, p, cn, opts)
+				if err != nil {
+					return // さかのぼりの失敗は黙って諦める（追従側が同じ理由を既に出している）
+				}
+				defer rc.Close()
+				lines := scanLogs(rc, p, cn)
+				mu.Lock()
+				out = append(out, lines...)
+				mu.Unlock()
+			}(p, cn)
+		}
+	}
+	wg.Wait()
+
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	return out
+}
+
+func containersOf(p *Pod) []string {
+	if len(p.Containers) == 0 {
+		return []string{""}
+	}
+	return p.Containers
+}
+
 func (s *LogStream) emit(ctx context.Context, l LogLine) {
 	select {
 	case s.Lines <- l:
@@ -82,9 +129,7 @@ func (s *LogStream) emit(ctx context.Context, l LogLine) {
 	}
 }
 
-func (c *Client) streamOne(ctx context.Context, s *LogStream, p *Pod, container string, opts LogOptions) {
-	defer s.wg.Done()
-
+func (c *Client) openLogs(ctx context.Context, p *Pod, container string, opts LogOptions) (io.ReadCloser, error) {
 	tail := opts.TailLines
 	req := c.Clientset.CoreV1().Pods(p.Namespace).GetLogs(p.Name, &corev1.PodLogOptions{
 		Container:  container,
@@ -93,7 +138,29 @@ func (c *Client) streamOne(ctx context.Context, s *LogStream, p *Pod, container 
 		TailLines:  &tail,
 		Timestamps: true,
 	})
-	rc, err := req.Stream(ctx)
+	return req.Stream(ctx)
+}
+
+func newScanner(r io.Reader) *bufio.Scanner {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	return sc
+}
+
+func scanLogs(r io.Reader, p *Pod, container string) []LogLine {
+	var out []LogLine
+	sc := newScanner(r)
+	for sc.Scan() {
+		ts, text := splitTimestamp(sc.Text())
+		out = append(out, LogLine{Pod: p.Name, Container: container, Time: ts, Text: text})
+	}
+	return out
+}
+
+func (c *Client) streamOne(ctx context.Context, s *LogStream, p *Pod, container string, opts LogOptions) {
+	defer s.wg.Done()
+
+	rc, err := c.openLogs(ctx, p, container, opts)
 	if err != nil {
 		s.emit(ctx, LogLine{Pod: p.Name, Container: container, Time: time.Now(), Notice: true,
 			Text: "ログを取得できません: " + trimAPIError(err.Error())})
@@ -101,8 +168,7 @@ func (c *Client) streamOne(ctx context.Context, s *LogStream, p *Pod, container 
 	}
 	defer rc.Close()
 
-	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sc := newScanner(rc)
 	for sc.Scan() {
 		ts, text := splitTimestamp(sc.Text())
 		s.emit(ctx, LogLine{Pod: p.Name, Container: container, Time: ts, Text: text})

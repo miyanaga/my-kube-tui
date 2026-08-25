@@ -108,7 +108,7 @@ func (m Model) nodeDetTitle() string {
 }
 
 func (m Model) infraDetContent(w int) string {
-	tabs := renderTabs([]string{"Pod", "概要", "イベント"}, m.tab, m.focus == paneNDetail)
+	tabs := renderTabs(m.detailTabLabels(), m.tab, m.focus == paneNDetail)
 	switch m.tab {
 	case 0:
 		return tabs + "\n" + m.podTableContent(w, true)

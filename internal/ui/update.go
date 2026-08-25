@@ -96,6 +96,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logClosedMsg:
 		return m, nil
 
+	case logHistoryMsg:
+		if msg.gen != m.logGen {
+			return m, nil
+		}
+		m.logLoading = false
+		if added := m.mergeLogHistory(msg.lines); added == 0 {
+			m.logExhausted = true
+			m.status = "これ以上さかのぼれません（Pod のログはここまで）"
+		} else {
+			m.status = k8s.FormatInt(int64(added)) + " 行さかのぼりました"
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -158,6 +174,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.status = "更新中…"
 		return m, m.refreshCmd()
+	case "M":
+		// マウスを掴んでいるあいだは端末側の範囲選択ができなくなるので、
+		// ログをコピーしたいときのために手放せるようにする。
+		m.mouse = !m.mouse
+		if m.mouse {
+			m.status = "マウス: on"
+			return m, tea.EnableMouseCellMotion
+		}
+		m.status = "マウス: off（端末の範囲選択が使えます）"
+		return m, tea.DisableMouse
 	case "tab":
 		m.cycleFocus(1)
 		return m, nil
@@ -261,6 +287,7 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 			m.workloads = nil
 			m.pWL, m.pDet = pane{}, pane{}
 			m.focus = paneWL
+			m.backToPodTab()
 			cmd := tea.Batch(m.fetchWorkloads(), m.syncLogStream())
 			return m, cmd
 		}
@@ -292,7 +319,14 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) switchTab(d int) tea.Cmd {
-	m.tab = (m.tab + d + 3) % 3
+	return m.setTab((m.tab + d + 3) % 3)
+}
+
+func (m *Model) setTab(i int) tea.Cmd {
+	if i == m.tab || i < 0 || i > 2 {
+		return nil
+	}
+	m.tab = i
 	m.pDet, m.pNDet = pane{}, pane{}
 	m.clampAll()
 	return tea.Batch(m.syncLogStream(), m.eventsIfNeeded())
@@ -350,11 +384,12 @@ func (m *Model) onSelectionChanged() tea.Cmd {
 			m.nsSel = vs[m.pNS.idx]
 			m.workloads = nil
 			m.pWL, m.pDet = pane{}, pane{}
+			m.backToPodTab()
 			return tea.Batch(m.fetchWorkloads(), m.syncLogStream(), m.eventsIfNeeded())
 		}
 	case paneWL:
 		m.pDet = pane{}
-		m.logScope = ""
+		m.backToPodTab()
 		return tea.Batch(m.syncLogStream(), m.eventsIfNeeded())
 	case paneNode:
 		m.pNDet = pane{}
@@ -384,7 +419,8 @@ func (m Model) scrollLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.logFollow = m.logOff == 0
-	return m, nil
+	cmd := m.maybeLoadMoreLogs()
+	return m, cmd
 }
 
 // focusedList は今の焦点に対応する「要素数・表示行数・スクロール位置」を返す。
@@ -536,9 +572,13 @@ func (m *Model) syncLogStream() tea.Cmd {
 	m.logCancel = cancel
 	m.logGen++
 	m.logLines = nil
+	m.logSeen = map[string]bool{}
 	m.logOff = 0
+	m.logTail = initialLogTail
+	m.logLoading = false
+	m.logExhausted = false
 	m.logStream = m.client.StreamPodLogs(ctx, m.logTargetPods(w), k8s.LogOptions{
-		TailLines: 300,
+		TailLines: initialLogTail,
 		Previous:  m.logPrev,
 		Follow:    !m.logPrev, // 直前のコンテナのログは follow できない
 	})
@@ -613,7 +653,12 @@ func pickDefaultNamespace(ns []string) string {
 const logMergeWindow = 400
 
 func (m *Model) appendLogLines(batch []k8s.LogLine) {
+	added := 0
 	for _, l := range batch {
+		if !m.markSeen(l) {
+			continue
+		}
+		added++
 		i := len(m.logLines)
 		if !l.Time.IsZero() {
 			limit := maxInt(0, i-logMergeWindow)
@@ -635,12 +680,99 @@ func (m *Model) appendLogLines(batch []k8s.LogLine) {
 	}
 	// 追従を止めているあいだは、行が増えても見ている位置が動かないようにする
 	// （末尾からのオフセットで持っているので、増えた分だけ足す）。
-	if !m.logFollow && len(batch) > 0 {
-		m.logOff = minInt(m.logOff+len(batch), maxInt(0, len(m.logLines)-1))
+	if !m.logFollow && added > 0 {
+		m.logOff = minInt(m.logOff+added, maxInt(0, len(m.logLines)-1))
 	}
 	if len(m.logLines) > maxLogLines {
 		drop := len(m.logLines) - maxLogLines
 		m.logLines = m.logLines[drop:]
 		m.logOff = maxInt(0, m.logOff-drop)
 	}
+}
+
+// markSeen は初めて見る行なら true。重複していれば false。
+func (m *Model) markSeen(l k8s.LogLine) bool {
+	if l.Notice {
+		return true
+	}
+	if m.logSeen == nil {
+		m.logSeen = map[string]bool{}
+	}
+	k := l.Key()
+	if m.logSeen[k] {
+		return false
+	}
+	m.logSeen[k] = true
+	return true
+}
+
+// mergeLogHistory はさかのぼって取り直した行を、既にある行と重複させずに差し込む。
+// 末尾からのオフセットで表示位置を持っているので、前に足しても見ている場所は動かない。
+func (m *Model) mergeLogHistory(lines []k8s.LogLine) int {
+	added := 0
+	for _, l := range lines {
+		if !m.markSeen(l) {
+			continue
+		}
+		i := len(m.logLines)
+		for i > 0 {
+			prev := m.logLines[i-1]
+			if prev.Time.IsZero() || !prev.Time.After(l.Time) {
+				break
+			}
+			i--
+		}
+		m.logLines = append(m.logLines, k8s.LogLine{})
+		copy(m.logLines[i+1:], m.logLines[i:])
+		m.logLines[i] = l
+		added++
+	}
+	return added
+}
+
+// maybeLoadMoreLogs は上端に着いていたら、もう一段さかのぼる取得を始める。
+func (m *Model) maybeLoadMoreLogs() tea.Cmd {
+	if m.mode != ModeApp || m.tab != 1 || m.client == nil {
+		return nil
+	}
+	if m.logLoading || m.logExhausted || m.logKey == "" {
+		return nil
+	}
+	n, h := len(m.visibleLogLines()), m.detRows()
+	if m.logOff < maxInt(0, n-h) {
+		return nil // まだ上端ではない
+	}
+	next := m.logTail * 3
+	if next > maxLogTail {
+		next = maxLogTail
+	}
+	if next <= m.logTail {
+		m.logExhausted = true
+		m.status = "これ以上さかのぼれません（1 Pod あたり " + k8s.FormatInt(maxLogTail) + " 行が上限）"
+		return nil
+	}
+
+	w := m.currentWorkload()
+	if w == nil {
+		return nil
+	}
+	pods, cl, gen, prev := m.logTargetPods(w), m.client, m.logGen, m.logPrev
+	m.logTail = next
+	m.logLoading = true
+	m.status = "過去のログを読み込み中…"
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		lines := cl.FetchPodLogs(ctx, pods, k8s.LogOptions{TailLines: next, Previous: prev})
+		return logHistoryMsg{gen: gen, lines: lines}
+	}
+}
+
+// backToPodTab は見ている対象が変わったときに Pod 一覧へ戻す。
+// 別のワークロードのログやイベントを開いたまま対象だけ入れ替わると、
+// 何を見ているのか分からなくなるため。
+func (m *Model) backToPodTab() {
+	m.tab = 0
+	m.logScope = ""
 }

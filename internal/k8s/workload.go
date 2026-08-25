@@ -209,7 +209,9 @@ func (c *Client) Workloads(ctx context.Context, ns string) ([]*Workload, error) 
 
 	out := make([]*Workload, 0, len(byRef))
 	for _, w := range byRef {
-		if w.Ref.Kind == "Pod" && len(w.Pods) > 0 {
+		// 裸の Pod と static Pod は「1 個あって動いていれば正常」として数える。
+		if (w.Ref.Kind == "Pod" || w.Ref.Kind == "Static") && len(w.Pods) > 0 {
+			w.Desired = 1
 			w.Ready = int32(boolToInt(w.Pods[0].Health == HealthOK || w.Pods[0].Health == HealthDone))
 			if len(w.Images) == 0 {
 				w.Images = w.Pods[0].Containers

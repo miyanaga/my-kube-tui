@@ -98,12 +98,20 @@ func (m Model) detTitle() string {
 	return w.Ref.Kind + " / " + w.Ref.Name
 }
 
-func (m Model) appDetContent(w int) string {
+// detailTabLabels は詳細ペインのタブ名。描画と当たり判定で共有する。
+func (m Model) detailTabLabels() []string {
+	if m.mode == ModeInfra {
+		return []string{"Pod", "概要", "イベント"}
+	}
 	labels := []string{"Pod", "ログ", "イベント"}
 	if m.tab == 1 {
 		labels[1] = "ログ" + m.logBadge()
 	}
-	tabs := renderTabs(labels, m.tab, m.focus == paneDetail)
+	return labels
+}
+
+func (m Model) appDetContent(w int) string {
+	tabs := renderTabs(m.detailTabLabels(), m.tab, m.focus == paneDetail)
 	switch m.tab {
 	case 0:
 		return tabs + "\n" + m.podTableContent(w, false)
@@ -123,7 +131,7 @@ func (m Model) logBadge() string {
 		parts = append(parts, "直前")
 	}
 	if !m.logFollow {
-		parts = append(parts, "停止")
+		parts = append(parts, "追従OFF")
 	}
 	if len(parts) == 0 {
 		return ""

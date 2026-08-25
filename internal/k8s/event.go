@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,6 +99,24 @@ func ShortDuration(d time.Duration) string {
 	default:
 		return itoa(int(d.Hours()/24)) + "d"
 	}
+}
+
+// FormatInt は 20000 → "20,000" のような桁区切り。
+func FormatInt(n int64) string {
+	s := itoa(int(n))
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	var out []byte
+	for i, c := range []byte(s) {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, c)
+	}
+	if neg {
+		return "-" + string(out)
+	}
+	return string(out)
 }
 
 func itoa(n int) string {
